@@ -1,0 +1,356 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>100M_CONDITION_DIAGNOSTIC.html</title>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+
+</head>
+
+<body>
+
+<h1>100M Condition Scaling Diagnostic</h1>
+<p><strong>Purpose</strong>: This document outlines the questions that must be answered BEFORE designing any scaling solution for calc-engine. Premature optimization without understanding the problem space leads to wasted effort and wrong solutions.</p>
+<p><strong>Source</strong>: Synthesized from expert consultation (Systems Engineer, Theoretical CS) and forensic architecture analysis (Glean, Slack, codebase examination).</p>
+<hr />
+<h2>Executive Summary</h2>
+<h3>Current State</h3>
+<p>| Metric               | Value                                          |
+|----------------------|------------------------------------------------|
+| Largest deployment   | Intel: 870K-1.3M conditions                    |
+| Practical ceiling    | ~200K monitored conditions                     |
+| Architecture         | Pull-based iterators (non-resumable)           |
+| Known migration path | Provider 2.0 (~70% designed, ~30% implemented) |</p>
+<h3>Target State</h3>
+<p>| Metric           | Value            |
+|------------------|------------------|
+| Total conditions | 10 million       |
+| Per-customer     | &gt;1 million       |
+| Timeline         | 2026             |
+| Scale factor     | ~50-125x current |</p>
+<h3>Why Questions First</h3>
+<ol>
+<li><strong>Bottleneck shifting</strong>: Scaling calc-engine reveals condition-monitor as next bottleneck</li>
+<li><strong>Unknown resource profile</strong>: No P50/P95/P99 latency data exists</li>
+<li><strong>Operator classification</strong>: Don't know which operators can parallelize (CALM theorem)</li>
+<li><strong>Root cause pattern</strong>: Current failures stem from datasource blocking, not compute</li>
+</ol>
+<hr />
+<h2>Part 1: Current State Assessment</h2>
+<h3>A. Architecture Overview</h3>
+<p><strong>Data Flow</strong>:
+<code>Historian/DB → Datasource Proxy → Compute Engine (Provider)
+→ Formula Evaluation (iterators) → Condition Results
+→ Condition Monitor Job → Notifications</code></p>
+<p><strong>Current Model Characteristics</strong>:
+- <strong>Pull semantics</strong>: Data fetched on-demand via <code>Provider</code> interface
+- <strong>Non-resumable</strong>: Failures require full restart
+- <strong>Unbatched</strong>: Individual item processing
+- <strong>Stateless</strong>: Good for horizontal scaling but limits incremental computation
+- <strong>Conditions not partitioned</strong>: Scheduled per monitor, not per condition</p>
+<p><strong>Architectural Limitations</strong>:
+| Limitation               | Impact                                                         |
+|--------------------------|----------------------------------------------------------------|
+| No reified graph         | Operations primary, graph derivative - can't analyze structure |
+| No monotonicity tracking | Can't classify operators as STREAMING vs BLOCKING              |
+| Formulas stored as text  | Must re-parse to analyze operator properties                   |
+| No windowing semantics   | Can't handle unbounded streams                                 |
+| Coarse-grained caching   | No incremental cache updates                                   |</p>
+<p><strong>Provider 2.0</strong> (the designed solution):
+| Aspect     | Current       | Provider 2.0   |
+|------------|---------------|----------------|
+| Data Flow  | Iterators     | Blocks         |
+| Trigger    | Polling       | Subscriptions  |
+| Execution  | On request    | As data exists |
+| Recovery   | Non-resumable | Resumable      |
+| Processing | Unbatched     | Batched        |</p>
+<h3>B. Known Pain Points</h3>
+<p><strong>Production Failures</strong>:</p>
+<p>| Customer | Scale         | Issue                   | Root Cause                                          |
+|----------|---------------|-------------------------|-----------------------------------------------------|
+| Intel    | 870K-1.3M     | UI "basically unusable" | GET endpoint returns ALL conditions (no pagination) |
+| Santos   | &gt;10K/hour     | Performance degradation | Resource contention                                 |
+| Santos   | &gt;800 monitors | OOM                     | Memory exhaustion                                   |
+| SBM      | 80K rows      | Table limit hit         | Query limits                                        |
+| Multiple | Various       | OOM errors              | JVM heap + pod OOMKills                             |</p>
+<p><strong>Root Cause Pattern</strong>:
+<code>Slow datasource → Thread blocking (hours) → Queue buildup → System unresponsive</code></p>
+<p><strong>Workarounds Currently in Production</strong>:
+- Parallel condition evaluation (shipped feature)
+- Increased timeouts: 60s → 2700s
+- Manual formula optimization (AE support)
+- Infrastructure band-aids (memory limit bumps)
+- Doubled thread pools (Flint Hills: 250K conditions working)</p>
+<p><strong>Blocked Improvements</strong>:
+- Compute Scaling Enhancements: Descoped entirely
+- Sample Iterator Removal: At-risk (staffing)
+- Next-gen push-based calc engine: Still in planning</p>
+<h3>C. Observability Status</h3>
+<p><strong>What EXISTS</strong>:
+- Signal Monitor: Per-monitor performance, distributed tracing, error logging
+- Calc engine compilation timing (added Dec 2025)
+- Request monitoring API (R58.0.0+)
+- Infrastructure: Grafana, DataDog</p>
+<p><strong>What's MISSING</strong>:
+| Gap | Impact |
+|-----|--------|
+| P50/P95/P99 latencies | Can't set SLAs or measure improvement |
+| Conditions/sec throughput | Don't know actual capacity |
+| Resource per condition | Can't identify outlier conditions |
+| Queue depth metrics | Can't detect backpressure |
+| Recomputation waste | Can't validate streaming migration ROI |</p>
+<hr />
+<h2>Part 2: Operational Questions</h2>
+<p><em>Questions a Senior Systems Engineer would ask before approving a 100x scale-up</em></p>
+<h3>2.1 Resource Utilization Profile</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's the 95th/99th percentile resource utilization under current load?
+- [ ] What's the breakdown: computation vs serialization vs coordination vs GC?
+- [ ] What's the memory allocation rate and GC pressure profile?
+- [ ] What's the data fetch:computation ratio (time fetching vs computing)?</p>
+<p><strong>Why</strong>: If already at 70%+ CPU/memory at current scale, can't make 100x without fundamental changes.</p>
+<h3>2.2 Load Characteristics</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's the distribution of graph sizes (nodes, edges, depth)?
+- [ ] What's the distribution of data access patterns (hot vs cold, temporal locality)?
+- [ ] What percentage of conditions share common subgraphs or data dependencies?
+- [ ] What's the temporal pattern? (continuous vs periodic bursts vs ad-hoc)</p>
+<p><strong>Why</strong>: 100M tiny graphs vs 1M complex graphs = completely different bottlenecks.</p>
+<h3>2.3 Failure Mode Analysis</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's failing NOW at current scale?
+- [ ] What's the tail latency distribution (p50, p95, p99, p99.9)?
+- [ ] What causes restarts/crashes today? Frequency?
+- [ ] Can you detect silent failures (wrong results vs no results)?</p>
+<p><strong>Why</strong>: Existing failures at 1M will be catastrophic at 100M.</p>
+<h3>2.4 Observability Gaps</h3>
+<p><strong>Must Answer</strong>:
+- [ ] Can you trace a single condition evaluation end-to-end with timing breakdown?
+- [ ] Do you have resource attribution per condition/graph/tenant?
+- [ ] Can you measure coordination overhead separately from work?
+- [ ] Do you have leading indicators of exhaustion (queue depth, request age)?</p>
+<p><strong>Why</strong>: Can't fix what you can't see. Need early warning signals, not lagging indicators.</p>
+<h3>2.5 Architectural Constraints</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's the coordination model? (centralized scheduler vs distributed)
+- [ ] How many network hops does typical evaluation require?
+- [ ] What's the fanout factor? (one request → N downstream)
+- [ ] Where does data get serialized/deserialized?
+- [ ] Do you have back-pressure mechanisms between stages?</p>
+<p><strong>Why</strong>: Centralized coordinators hit scaling walls fast. Each hop adds latency variance.</p>
+<h3>2.6 Downstream Impact</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's condition-monitor's throughput capacity TODAY?
+- [ ] What's the write capacity of storage layer?
+- [ ] Can downstream consumers keep up with increased update rate?
+- [ ] What's the blast radius of single node failure?
+- [ ] Do you have graceful degradation modes?</p>
+<p><strong>Why</strong>: Scaling calc-engine is pointless if condition-monitor caps at 10M/sec.</p>
+<h3>2.7 Scaling Cliff Detection</h3>
+<p><strong>Must Answer</strong>:
+- [ ] How does latency change when you double current load?
+- [ ] What's cache hit rate? How does it change with scale?
+- [ ] Do you have global locks, singletons, or centralized coordinators?
+- [ ] What happens when you restart all nodes simultaneously?
+- [ ] What's memory usage growth rate vs condition count?</p>
+<p><strong>Why</strong>: If latency &gt;2x when load doubles, you have superlinear scaling. Cliff ahead.</p>
+<hr />
+<h2>Part 3: Theoretical Questions</h2>
+<p><em>Questions a Theoretical CS expert would ask to understand fundamental limits</em></p>
+<h3>3.1 Fundamental Limits &amp; Parallelism</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What is the maximum path length (critical path) in computation graphs?
+- [ ] What fraction of operations have no outgoing dependencies?
+- [ ] What is the graph's width (maximum independent set at any level)?
+- [ ] Are there structural bottlenecks (nodes with high in-degree/out-degree)?</p>
+<p><strong>Why</strong>: Amdahl's Law - parallel speedup bounded by longest dependency chain.</p>
+<h3>3.2 Monotonicity &amp; CALM Analysis</h3>
+<p><strong>Must Answer</strong>:
+- [ ] Which operators produce outputs that grow monotonically with input?
+- [ ] For non-monotonic operators, what triggers output retraction?
+- [ ] What is the minimum number of strata needed?
+- [ ] Which operations require global knowledge (argmax, ranking, quantiles)?
+- [ ] What consistency guarantees are actually required?</p>
+<p><strong>Why</strong>: CALM theorem - monotonic ⟺ coordination-free. Non-monotonic requires barriers.</p>
+<p><strong>CALM Implications</strong>:
+| Graph Type | Scaling Strategy |
+|------------|------------------|
+| Fully monotonic | Compute anywhere, merge anytime, no coordination |
+| Mostly monotonic | Partition into strata, synchronize at boundaries |
+| Heavily non-monotonic | Traditional distributed coordination required |</p>
+<h3>3.3 Complexity Cliffs</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What is time complexity of each operator vs input size?
+- [ ] Does canonicalization use AC-matching? (NP-complete)
+- [ ] How does operator fusion affect complexity?
+- [ ] What is fan-out complexity of broadcast nodes?
+- [ ] At what N does computation change from CPU-bound to I/O-bound?</p>
+<p><strong>Red Flags</strong>:
+- O(N²): Nested joins, Cartesian products
+- O(2^N): Combinatorial explosion (power sets)
+- AC-matching: NP-complete pattern matching</p>
+<h3>3.4 Operator Classification</h3>
+<p><strong>Must Answer</strong>:
+- [ ] Which operators are decomposable? (<code>f(A ∪ B) = g(f(A), f(B))</code>)
+- [ ] Which operators are invertible? (support retraction)
+- [ ] Which operator pairs commute? (order doesn't matter)
+- [ ] Which operators preserve partitioning?</p>
+<p><strong>Classification Matrix</strong>:
+| Operator | Decomposable | Invertible | Commutative |
+|----------|--------------|------------|-------------|
+| SUM | ✓ | ✓ | ✓ |
+| COUNT | ✓ | ✓ | ✓ |
+| MIN/MAX | ✓ | ✗ | ✓ |
+| AVG | ✓ (with bookkeeping) | ✓ | ✓ |
+| MEDIAN | ✗ | ✗ | ✓ |
+| PERCENTILE | ✗ exact | ✗ | ✓ |</p>
+<h3>3.5 Information-Theoretic Bounds</h3>
+<p><strong>Must Answer</strong>:
+- [ ] What's minimum information that must cross stratum boundaries?
+- [ ] What's communication complexity of distributed operators?
+- [ ] Can operators use gossip protocols for eventual consistency?
+- [ ] What's the decision tree complexity for key operations?</p>
+<p><strong>Why</strong>: Establishes theoretical best-case. If current is far from bounds, optimization possible.</p>
+<hr />
+<h2>Part 4: Information Gaps</h2>
+<h3>What We NEED</h3>
+<p>| Category | Specific Need | Why Critical | Source |
+|----------|---------------|--------------|--------|
+| <strong>Latency</strong> | P50/P95/P99 condition evaluation | Can't set SLAs | Add instrumentation |
+| <strong>Throughput</strong> | Conditions/sec capacity | Don't know ceiling | Add telemetry |
+| <strong>Attribution</strong> | Resource per condition | Identify outliers | Add tracing |
+| <strong>Distribution</strong> | Tenant size distribution | Know if 10% = 90% load | Analytics query |
+| <strong>Monotonicity</strong> | Operator classification | Determine parallelizability | Code audit |
+| <strong>Downstream</strong> | Condition-monitor capacity | Prevent bottleneck shift | Load test |
+| <strong>Graph Structure</strong> | Depth, width, sharing | Understand workload | Telemetry |</p>
+<h3>How to Get It</h3>
+<p>| Method | Reveals | Owner | Effort |
+|--------|---------|-------|--------|
+| Add P50/P95/P99 instrumentation | Latency distribution | Platform | Medium |
+| Add throughput counters | Actual capacity | Platform | Low |
+| Add per-condition tracing | Resource attribution | Platform | Medium |
+| Analytics query on conditions | Tenant distribution | Data team | Low |
+| Code audit of operators | Monotonicity classification | Calc Engine squad | High |
+| Load test at 10x | Downstream capacity | DevEx | High |
+| Graph analysis telemetry | Structure metrics | Calc Engine squad | Medium |</p>
+<h3>Who to Interview</h3>
+<p>| Role | Questions | Contact |
+|------|-----------|---------|
+| <strong>Platform Team</strong> | What metrics exist? What dashboards? Current capacity estimates? | Platform lead |
+| <strong>SRE</strong> | What incidents have occurred? What monitoring gaps? Recovery procedures? | SRE on-call |
+| <strong>Customer Success</strong> | What do customers complain about? Workarounds in use? | CS lead |
+| <strong>Senior Engineers</strong> | Why is architecture this way? What constraints exist? Provider 2.0 status? | Ben Johnson, Ben Bishop |
+| <strong>Product</strong> | What's the business case for 100M? Is it validated demand? | Product manager |</p>
+<hr />
+<h2>Part 5: Interview Guide</h2>
+<h3>Platform Team Interview</h3>
+<ol>
+<li>What telemetry currently exists for calc-engine?</li>
+<li>What are current P50/P95/P99 latencies? (If unknown, why?)</li>
+<li>How many conditions exist today across all tenants?</li>
+<li>What's the tenant size distribution?</li>
+<li>What capacity limits are documented?</li>
+<li>What observability gaps do you see?</li>
+</ol>
+<h3>SRE Interview</h3>
+<ol>
+<li>What incidents have occurred related to calc-engine/condition-monitor?</li>
+<li>What's the typical failure pattern?</li>
+<li>What manual interventions are required today?</li>
+<li>What would break first at 10x scale?</li>
+<li>What monitoring would you want before scaling?</li>
+</ol>
+<h3>Customer Success Interview</h3>
+<ol>
+<li>What do customers complain about regarding conditions?</li>
+<li>What workarounds do customers use?</li>
+<li>Which customers have the most conditions?</li>
+<li>What SLA expectations exist?</li>
+<li>Are there customers we've had to refuse or limit?</li>
+</ol>
+<h3>Senior Engineer Interview</h3>
+<ol>
+<li>Why is the architecture pull-based?</li>
+<li>What is Provider 2.0 status? Blockers?</li>
+<li>Which operators are known to be problematic?</li>
+<li>What assumptions are baked into current design?</li>
+<li>What would you do differently if starting fresh?</li>
+</ol>
+<hr />
+<h2>Part 6: Next Steps</h2>
+<h3>Immediate Actions (can do now)</h3>
+<ul>
+<li>[ ] Run analytics query for tenant condition distribution</li>
+<li>[ ] Search Slack history for past scaling discussions (done - see findings)</li>
+<li>[ ] Review Provider 2.0 design docs in Confluence</li>
+<li>[ ] Schedule interviews with Platform, SRE, CS</li>
+</ul>
+<h3>Short-term (requires instrumentation)</h3>
+<ul>
+<li>[ ] Add P50/P95/P99 latency instrumentation</li>
+<li>[ ] Add throughput counters (conditions/sec)</li>
+<li>[ ] Add per-condition resource attribution</li>
+<li>[ ] Create calc-engine performance dashboard</li>
+</ul>
+<h3>Medium-term (requires load testing)</h3>
+<ul>
+<li>[ ] Load test at 10x current scale</li>
+<li>[ ] Load test condition-monitor independently</li>
+<li>[ ] Profile memory usage growth curve</li>
+<li>[ ] Identify complexity cliffs empirically</li>
+</ul>
+<h3>Before Any Scaling Work</h3>
+<ol>
+<li>✅ Document current state (this document)</li>
+<li>⬜ Fill observability gaps (latency, throughput)</li>
+<li>⬜ Classify operators by monotonicity</li>
+<li>⬜ Load test at 10x to find cliffs</li>
+<li>⬜ Validate downstream capacity</li>
+<li>⬜ Get stakeholder alignment on priorities</li>
+</ol>
+<hr />
+<h2>Appendix A: The Bottleneck Shift Problem</h2>
+<p><code>┌────────────┐    ┌─────────────┐    ┌───────────────────┐    ┌───────────────┐
+│ Historian  │───▶│ Calc Engine │───▶│ Condition Monitor │───▶│ Notifications │
+└────────────┘    └─────────────┘    └───────────────────┘    └───────────────┘
+                        │                      │
+                        ▼                      ▼
+                  Scale this?           Then THIS breaks!</code></p>
+<p><strong>Insight</strong>: Optimizing calc-engine in isolation is futile if condition-monitor becomes the bottleneck.</p>
+<p><strong>Questions for Pipeline Analysis</strong>:
+1. What's condition-monitor's current throughput?
+2. What happens when it's overwhelmed? (Back-pressure? Silent failure?)
+3. Can it scale independently?
+4. What other consumers exist downstream?
+5. What's the end-to-end latency budget?</p>
+<hr />
+<h2>Appendix B: CALM Theorem Reference</h2>
+<p><strong>CALM</strong>: Consistency As Logical Monotonicity</p>
+<blockquote>
+<p>A program has a consistent, coordination-free distributed implementation if and only if it is monotonic.</p>
+</blockquote>
+<p><strong>Implications</strong>:
+- Monotonic operators (union, max, sum) → can parallelize freely
+- Non-monotonic operators (negation, argmax, median) → require coordination
+- Stratification partitions graph into monotonic layers with barriers between</p>
+<p><strong>Operator Lattice Examples</strong>:
+| Operator | Lattice | Join (⊔) | Bottom (⊥) |
+|----------|---------|----------|------------|
+| MAX | (ℕ, ≤) | max | -∞ |
+| MIN | (ℕ, ≥) | min | +∞ |
+| SUM | (ℕ, ≤) | + | 0 |
+| SET UNION | (𝒫(X), ⊆) | ∪ | ∅ |</p>
+<hr />
+<h2>Appendix C: Source Material</h2>
+<ul>
+<li><code>reference-docs/brainstorming/resource-optimization-conversation.json</code> - Original diagnostic framework discussion</li>
+<li>Slack: #calc-engine-squad, #intel, #vantage-discussions-and-support - Production evidence</li>
+<li>Local docs: <code>reference-docs/calc-engine-architecture/</code> - Architecture analysis</li>
+<li>Expert consultation: Systems Engineer, Theoretical CS perspectives</li>
+<li>Forensic analysis: 3 architects examining Glean, Slack, codebase</li>
+</ul>
+</body>
+</html>
